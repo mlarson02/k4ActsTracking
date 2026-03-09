@@ -555,7 +555,7 @@ StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrack
           edm4hep::MutableTrack* track = ACTSTracking::ACTS2edm4hep_track(trackTip, magneticField(), magCache);
 
         // Save results
-        trackCollection.push_back(*track);
+        trackCollection.push_back(track);
       }
     } else {
       warning() << "Track fit error: " << result.error() << endmsg;
