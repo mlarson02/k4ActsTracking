@@ -18,6 +18,9 @@
  */
 #include "k4ActsTracking/ACTSSeededCKFTrackingAlg.hxx"
 
+// ACTSTracking
+#include "k4ActsTracking/MeasurementCalibrator.hxx"
+
 // edm4hep
 #include <edm4hep/MCParticle.h>
 #include <edm4hep/MutableTrack.h>
@@ -30,18 +33,13 @@
 #include <GaudiKernel/MsgStream.h>
 
 // ACTS
-#include <Acts/EventData/MultiTrajectory.hpp>
-#include <Acts/Propagator/EigenStepper.hpp>
-#include <Acts/Propagator/Navigator.hpp>
-#include <Acts/Propagator/Propagator.hpp>
-#include <Acts/Seeding/EstimateTrackParamsFromSeed.hpp>
-#include <Acts/Seeding/SeedFinder.hpp>
 #include <Acts/Seeding/SpacePointGrid.hpp>
 #include <Acts/Surfaces/PerigeeSurface.hpp>
 #include <Acts/TrackFinding/CombinatorialKalmanFilter.hpp>
 #include <Acts/TrackFinding/MeasurementSelector.hpp>
 #include <Acts/TrackFinding/TrackStateCreator.hpp>
 #include <Acts/TrackFitting/GainMatrixUpdater.hpp>
+#include <Acts/Utilities/RangeXD.hpp>
 
 // TBB
 #include <tbb/concurrent_vector.h>
@@ -49,27 +47,9 @@
 #include <tbb/parallel_sort.h>
 #include <tbb/task_arena.h>
 
-//using namespace Acts::UnitLiterals;
-
-// ACTSTracking
-#include "k4ActsTracking/Helpers.hxx"
-#include "k4ActsTracking/MeasurementCalibrator.hxx"
-#include "k4ActsTracking/SeedSpacePoint.hxx"
-#include "k4ActsTracking/SourceLink.hxx"
-#include "k4ActsTracking/SpacePointContainer.hxx"
-
-// Standard
 #include <chrono>
 
-// Track fitting definitions
-using TrackContainer = Acts::TrackContainer<Acts::VectorTrackContainer, Acts::VectorMultiTrajectory, std::shared_ptr>;
-using TrackFinderOptions = Acts::CombinatorialKalmanFilterOptions<TrackContainer>;
-
-using SSPoint = typename Acts::SpacePointContainer<
-    ACTSTracking::SpacePointContainer<std::vector<const ACTSTracking::SeedSpacePoint*>>,
-    Acts::detail::RefHolder>::SpacePointProxyType;
-
-using SSPointGrid = Acts::CylindricalSpacePointGrid<SSPoint>;
+using namespace Acts::UnitLiterals;
 
 DECLARE_COMPONENT(ACTSSeededCKFTrackingAlg)
 
@@ -508,6 +488,70 @@ StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrack
   TrackFinderOptions ckfOptions =
       TrackFinderOptions(geometryContext(), magneticFieldContext(), calibrationContext(), extensions, pOptions);
 
+  float minRange = std::numeric_limits<float>::max();
+  float maxRange = std::numeric_limits<float>::lowest();
+  for (const auto& coll : grid) {
+    if (coll.empty())
+      continue;
+
+    const auto* firstEl = coll.front();
+    const auto* lastEl  = coll.back();
+    minRange            = std::min(firstEl->radius(), minRange);
+    maxRange            = std::max(lastEl->radius(), maxRange);
+  }
+
+  auto spacePointsGrouping = Acts::CylindricalBinnedGroup<SSPoint>(std::move(grid), bottomBinFinder, topBinFinder);
+
+  const Acts::Range1D<float> rMiddleSPRange(std::floor(minRange / 2) * 2 + finderCfg.deltaRMiddleMinSPRange,
+                                            std::floor(maxRange / 2) * 2 - finderCfg.deltaRMiddleMaxSPRange);
+
+  // Convert the binned group to a vector for access
+  using GroupIterator = decltype(spacePointsGrouping.begin());
+  using GroupValue    = std::decay_t<decltype(*std::declval<GroupIterator>())>;
+  std::vector<GroupValue> spacePointGroups;
+  spacePointGroups.reserve(spacePointsGrouping.grid().size());
+  for (auto spGroup : spacePointsGrouping) {
+    spacePointGroups.push_back(spGroup);
+  }
+
+  auto parallelSeedingAndTracking = [&](const tbb::blocked_range<size_t>& r) {
+    for (size_t i = r.begin(); i != r.end(); ++i) {
+      const auto paramseeds = findSeeds(finder, finderOpts, spacePointGroups[i], spacePointsGrouping.grid(),
+                                        rMiddleSPRange, spContainer.size(), seedCollection, magCache);
+
+      // Find the tracks
+      if (!m_runCKF)
+        continue;
+
+      if (!tracking(paramseeds, trackFinder, ckfOptions, magCache, trackCollection).isSuccess()) {
+        warning() << "Tracking failed for this event" << endmsg;
+      }
+    }
+  };  // parallelSeedingAndTracking
+
+  // Run in parallel if more than one thread is requested
+  if (m_numThreads > 1) {
+    arena.execute(
+        [&] { tbb::parallel_for(tbb::blocked_range<size_t>(0, spacePointGroups.size()), parallelSeedingAndTracking); });
+  } else {  // Serial execution
+    for (size_t i = 0; i < spacePointGroups.size(); ++i) {
+      parallelSeedingAndTracking(tbb::blocked_range<size_t>(i, i + 1));
+    }
+  }
+
+  debug() << "Track Collection Size: " << trackCollection.size() << endmsg;
+
+  return std::make_tuple(std::move(seedCollection), std::move(trackCollection));
+}
+
+// CKF tracking,
+StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrackParameters>& paramseeds,
+                                              const CKF& trackFinder, const TrackFinderOptions& ckfOptions,
+                                              Acts::MagneticFieldProvider::Cache& magCache,
+                                              edm4hep::TrackCollection&           trackCollection) const {
+  // Initialize track finder
+  debug() << "Starting CKF track finding with " << paramseeds.size() << " seeds." << endmsg;
+
   auto           trackContainer      = std::make_shared<Acts::VectorTrackContainer>();
   auto           trackStateContainer = std::make_shared<Acts::VectorMultiTrajectory>();
   TrackContainer tracks(trackContainer, trackStateContainer);
@@ -555,7 +599,10 @@ StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrack
           edm4hep::MutableTrack* track = ACTSTracking::ACTS2edm4hep_track(trackTip, magneticField(), magCache);
 
         // Save results
-        trackCollection.push_back(track);
+        {
+          std::lock_guard lock{m_trackMutex};
+          trackCollection.push_back(track);
+        }
       }
     } else {
       warning() << "Track fit error: " << result.error() << endmsg;
