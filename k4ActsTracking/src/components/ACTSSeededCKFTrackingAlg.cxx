@@ -39,6 +39,7 @@
 
 // TBB
 #include <tbb/concurrent_vector.h>
+#include <tbb/enumerable_thread_specific.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_sort.h>
 #include <tbb/task_arena.h>
@@ -119,6 +120,7 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
   auto compare = [](const auto& a, const auto& b) { return a.first < b.first; };
 
   tbb::task_arena arena(m_numThreads.value());
+  std::cout << "m_numThreads: " << m_numThreads << "\n";
 
   if (m_numThreads > 1) {
     arena.execute([&] { tbb::parallel_sort(sortedHits.begin(), sortedHits.end(), compare); });
@@ -308,11 +310,91 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
     spacePointGroups.push_back(*it);
   }
 
-  // Mutex for thread-safe seed and track addition
-  std::mutex seedMutex;
-  std::mutex trackMutex;
+  // CKF setup
+  Navigator::Config navigatorCfg{trackingGeometry()};
+  navigatorCfg.resolvePassive   = false;
+  navigatorCfg.resolveMaterial  = true;
+  navigatorCfg.resolveSensitive = true;
+
+  Stepper    stepper(magneticField());
+  Navigator  navigator(navigatorCfg);
+  Propagator propagator(std::move(stepper), std::move(navigator));
+  CKF        trackFinder(std::move(propagator));
+
+  Acts::MeasurementSelector::Config measurementSelectorCfg = {
+      {Acts::GeometryIdentifier(), {{}, {m_CKF_chi2CutOff}, {(std::size_t)(m_CKF_numMeasurementsCutOff)}}}};
+
+  Acts::PropagatorPlainOptions pOptions{geometryContext(), magneticFieldContext()};
+  pOptions.maxSteps = 10000;
+  // Outside-in mode uses a backward first pass (from outermost seed SP inward).
+  if (m_propagateBackward || m_doOutsideInCKF) {
+    pOptions.direction = Acts::Direction::Backward();
+  }
+
+  std::shared_ptr<Acts::PerigeeSurface> perigeeSurface =
+      Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3{0., 0., 0.});
+
+  Acts::GainMatrixUpdater            kfUpdater;
+  Acts::MeasurementSelector          measSel{measurementSelectorCfg};
+  ACTSTracking::MeasurementCalibrator measCal{measurements};
+
+  ACTSTracking::SourceLinkAccessor slAccessor;
+  slAccessor.container = &sourceLinks;
+
+  using TrackStateCreatorType = Acts::TrackStateCreator<ACTSTracking::SourceLinkAccessor::Iterator, TrackContainer>;
+  TrackStateCreatorType trackStateCreator;
+  trackStateCreator.sourceLinkAccessor.template connect<&ACTSTracking::SourceLinkAccessor::range>(&slAccessor);
+  trackStateCreator.calibrator.template connect<&ACTSTracking::MeasurementCalibrator::calibrate>(&measCal);
+  trackStateCreator.measurementSelector
+      .template connect<&Acts::MeasurementSelector::select<Acts::VectorMultiTrajectory>>(&measSel);
+
+  Acts::CombinatorialKalmanFilterExtensions<TrackContainer> extensions;
+  extensions.updater.connect<&Acts::GainMatrixUpdater::operator()<Acts::VectorMultiTrajectory>>(&kfUpdater);
+  extensions.createTrackStates.template connect<&TrackStateCreatorType::createTrackStates>(&trackStateCreator);
+
+  TrackFinderOptions ckfOptions =
+      TrackFinderOptions(geometryContext(), magneticFieldContext(), calibrationContext(), extensions, pOptions);
+
+  // First pass target surface:
+  //   nullptr (default) lets the CKF propagate freely from the seed and collect
+  //   every reachable measurement until the navigator runs out of surfaces.
+  //   Setting it makes the CKF *terminate* on that surface — not a post-CKF
+  //   extrapolation hook.
+  // Outside-in: first pass is a backward propagation that we want to terminate
+  //   at perigee, so the smoothed parameters carry valid perigee/AtIP state.
+  // Inside-out single-pass: do NOT set targetSurface even if UsePerigeeSurface
+  //   is requested. With forward propagation from an inner seed, perigee sits
+  //   behind the seed and the propagator aborts almost immediately, producing
+  //   2-hit "tracks" (the seed only). If perigee output is needed for a
+  //   single-pass forward CKF, do it as a separate post-fit extrapolation.
+  if (m_doOutsideInCKF) {
+    ckfOptions.targetSurface = perigeeSurface.get();
+  }
+
+  // Second-pass options for two-way CKF.
+  // Inside-out (default): forward first pass → backward second pass to perigee.
+  // Outside-in:           backward first pass → forward second pass outward (no target surface).
+  Acts::PropagatorPlainOptions secondPOptions{geometryContext(), magneticFieldContext()};
+  secondPOptions.maxSteps  = 10000;
+  secondPOptions.direction = m_doOutsideInCKF ? Acts::Direction::Forward() : Acts::Direction::Backward();
+  TrackFinderOptions secondOptions =
+      TrackFinderOptions(geometryContext(), magneticFieldContext(), calibrationContext(), extensions, secondPOptions);
+  secondOptions.skipPrePropagationUpdate = true;
+  if (!m_doOutsideInCKF) {
+    // Inside-out first pass: backward second pass terminates at perigee.
+    secondOptions.targetSurface = perigeeSurface.get();
+  }
+
+  std::atomic<int>                     ckfActiveThreads{0};
+  tbb::enumerable_thread_specific<bool> ckfThreadInit;  // default false per thread
 
   auto parallelSeedingAndTracking = [&](const tbb::blocked_range<size_t>& r) {
+    auto& initialized = ckfThreadInit.local();
+    if (!initialized) {
+      initialized = true;
+      info() << "CKF parallel thread #" << ++ckfActiveThreads << " started (of " << m_numThreads << " requested)"
+             << endmsg;
+    }
     for (size_t i = r.begin(); i != r.end(); ++i) {
       const auto& [bottom, middle, top] = spacePointGroups[i];
       // Local objects for thread safety
@@ -334,9 +416,12 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
       }
 
       for (const auto& seed : f_seeds) {
-        const ACTSTracking::SeedSpacePoint* bottomSP = seed.sp().front();
+        // For outside-in: CKF starts from outermost (top) SP propagating backward;
+        // default inside-out: start from innermost (bottom) SP propagating forward.
+        const ACTSTracking::SeedSpacePoint* startSP =
+            m_doOutsideInCKF ? seed.sp().back() : seed.sp().front();
 
-        const auto&                     sourceLink = bottomSP->sourceLink();
+        const auto&                     sourceLink = startSP->sourceLink();
         const Acts::GeometryIdentifier& geoId      = sourceLink.geometryId();
         const Acts::Surface*            surface    = trackingGeometry()->findSurface(geoId);
         if (surface == nullptr) {
@@ -344,26 +429,67 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
           continue;
         }
 
-        // Get the magnetic field at the bottom space point
-        const Acts::Vector3         seedPos(bottomSP->x(), bottomSP->y(), bottomSP->z());
+        // Get the magnetic field at the starting space point
+        const Acts::Vector3         seedPos(startSP->x(), startSP->y(), startSP->z());
         Acts::Result<Acts::Vector3> seedField = magneticField()->getField(seedPos, magCache);
         if (!seedField.ok()) {
           throw std::runtime_error("Field lookup error: " + std::to_string(seedField.error().value()));
         }
 
-        Acts::Result<Acts::BoundVector> optParams =
-            Acts::estimateTrackParamsFromSeed(geometryContext(), seed.sp(), *surface, *seedField);
-        if (!optParams.ok()) {
+        // estimateTrackParamsFromSeed(gctx, spRange, surface, bField) internally projects sp[0]'s
+        // (bottom/inner SP) global position onto `surface` via transformFreeToBoundParameters.
+        // For outside-in, `surface` is the outer SP surface and sp[0] is the inner SP — the inner
+        // position projects far outside the outer sensor plane, so transformFreeToBoundParameters
+        // returns an error. Fix: get the FreeVector (phi/theta/q/p correct from circle fit), replace
+        // only the position with the outer SP, then project to the surface explicitly.
+        Acts::Result<Acts::BoundVector> optParamsResult = [&]() -> Acts::Result<Acts::BoundVector> {
+          if (m_doOutsideInCKF) {
+            Acts::FreeVector freeParams = Acts::estimateTrackParamsFromSeed(seed.sp(), *seedField);
+            freeParams[Acts::eFreePos0] = startSP->x();
+            freeParams[Acts::eFreePos1] = startSP->y();
+            freeParams[Acts::eFreePos2] = startSP->z();
+            return Acts::transformFreeToBoundParameters(freeParams, *surface, geometryContext());
+          }
+          return Acts::estimateTrackParamsFromSeed(geometryContext(), seed.sp(), *surface, *seedField);
+        }();
+        if (!optParamsResult.ok()) {
           debug() << "Failed estimation of track parameters for seed." << endmsg;
           continue;
         }
 
-        const Acts::BoundVector& params = *optParams;
+        Acts::BoundVector params = *optParamsResult;
 
         float p = std::abs(1 / params[Acts::eBoundQOverP]);
 
+        // --- Seed debug printout (commented out) ---
+        //{
+        //  const auto& sps = seed.sp();
+        //  const ACTSTracking::SeedSpacePoint* botSP = sps[0];
+        //  const ACTSTracking::SeedSpacePoint* midSP = sps[1];
+        //  const ACTSTracking::SeedSpacePoint* topSP = sps[2];
+        //  Acts::Vector3 globalParamPos =
+        //      surface->localToGlobal(geometryContext(),
+        //                             {params[Acts::eBoundLoc0], params[Acts::eBoundLoc1]},
+        //                             {0, 0, 0});
+        //  warning() << "Seed: bot geoId=" << botSP->sourceLink().geometryId()
+        //            << " pos=(" << botSP->x() << "," << botSP->y() << "," << botSP->z() << ")"
+        //            << " | mid geoId=" << midSP->sourceLink().geometryId()
+        //            << " pos=(" << midSP->x() << "," << midSP->y() << "," << midSP->z() << ")"
+        //            << " | top geoId=" << topSP->sourceLink().geometryId()
+        //            << " pos=(" << topSP->x() << "," << topSP->y() << "," << topSP->z() << ")"
+        //            << " start=" << (m_doOutsideInCKF ? "top" : "bot")
+        //            << endmsg;
+        //  warning() << "Seed params: phi=" << params[Acts::eBoundPhi]
+        //            << " theta=" << params[Acts::eBoundTheta]
+        //            << " p=" << p
+        //            << " loc0=" << params[Acts::eBoundLoc0]
+        //            << " loc1=" << params[Acts::eBoundLoc1]
+        //            << " globalPos=(" << globalParamPos.transpose() << ")"
+        //            << endmsg;
+        //}
+
         // build the track covariance matrix using the smearing sigmas
-        Acts::BoundSquareMatrix cov                 = Acts::BoundSquareMatrix::Zero();
+        Acts::BoundMatrix cov                       = Acts::BoundMatrix::Zero();
         cov(Acts::eBoundLoc0, Acts::eBoundLoc0)     = std::pow(m_initialTrackError_pos, 2);
         cov(Acts::eBoundLoc1, Acts::eBoundLoc1)     = std::pow(m_initialTrackError_pos, 2);
         cov(Acts::eBoundTime, Acts::eBoundTime)     = std::pow(m_initialTrackError_time, 2);
@@ -383,17 +509,17 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
           throw std::runtime_error("Field lookup error: " + std::to_string(hitField.error().value()));
         }
 
-        edm4hep::TrackState* seedTrackState = ACTSTracking::ACTS2edm4hep_trackState(
+        edm4hep::TrackState seedTrackState = ACTSTracking::ACTS2edm4hep_trackState(
             edm4hep::TrackState::AtFirstHit, paramseed, (*hitField)[2] / Acts::UnitConstants::T);
 
         // Add seed to collection, all building of seed under the lock
         {
-          std::lock_guard<std::mutex> lock(seedMutex);
+          std::lock_guard<std::mutex> lock(m_seedMutex);
           auto                        seedTrack = seedCollection.create();
           for (const ACTSTracking::SeedSpacePoint* sp : seed.sp()) {
             seedTrack.addToTrackerHits(sp->sourceLink().edm4hepHit());
           }
-          seedTrack.addToTrackStates(*seedTrackState);
+          seedTrack.addToTrackStates(seedTrackState);
         }
 
         debug() << "Seed Paramemeters" << std::endl << paramseed << endmsg;
@@ -405,205 +531,193 @@ std::tuple<edm4hep::TrackCollection, edm4hep::TrackCollection> ACTSSeededCKFTrac
       if (!m_runCKF)
         continue;
 
-    // pass paramseeds, measurements, sourceLinks, magCache; stores tracks in trackCollection
-    if (!tracking(paramseeds, measurements, sourceLinks, magCache, trackCollection).isSuccess()) {
-      warning() << "Tracking failed for this event" << endmsg;
-    }
-  }
-
-  auto                          entireEnd      = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> entireDuration = entireEnd - entireStart;
-  //m_histEntireReco->Fill(entireDuration.count());
-  info() << "Track Collection Size: " << trackCollection.size() << endmsg;
-
-  return std::make_tuple(std::move(seedCollection), std::move(trackCollection));
-}
-
-// CKF tracking,
-StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrackParameters>& paramseeds,
-                                              const ACTSTracking::MeasurementContainer&      measurements,
-                                              const ACTSTracking::SourceLinkContainer&       sourceLinks,
-                                              Acts::MagneticFieldProvider::Cache&            magCache,
-                                              edm4hep::TrackCollection&                      trackCollection) const {
-  // Initialize track finder
-  warning() << "Starting CKF track finding with " << paramseeds.size() << " seeds." << endmsg;
-  using Stepper    = Acts::EigenStepper<>;
-  using Navigator  = Acts::Navigator;
-  using Propagator = Acts::Propagator<Stepper, Navigator>;
-  using CKF        = Acts::CombinatorialKalmanFilter<Propagator, TrackContainer>;
-
-  // Configurations
-  Navigator::Config navigatorCfg{trackingGeometry()};
-  navigatorCfg.resolvePassive   = false;
-  navigatorCfg.resolveMaterial  = true;
-  navigatorCfg.resolveSensitive = true;
-
-  // construct all components for the fitter
-  Stepper    stepper(magneticField());
-  Navigator  navigator(navigatorCfg);
-  Propagator propagator(std::move(stepper), std::move(navigator));
-  CKF        trackFinder(std::move(propagator));
-
-  // Set the options
-  Acts::MeasurementSelector::Config measurementSelectorCfg = {
-      {Acts::GeometryIdentifier(), {{}, {m_CKF_chi2CutOff}, {(std::size_t)(m_CKF_numMeasurementsCutOff)}}}};
-
-  Acts::PropagatorPlainOptions pOptions{geometryContext(), magneticFieldContext()};
-  pOptions.maxSteps = 10000;
-  if (m_propagateBackward) {
-    pOptions.direction = Acts::Direction::Backward();
-  }
-
-  // Construct a perigee surface as the target surface
-  std::shared_ptr<Acts::PerigeeSurface> perigeeSurface =
-      Acts::Surface::makeShared<Acts::PerigeeSurface>(Acts::Vector3{0., 0., 0.});
-
-  Acts::GainMatrixUpdater kfUpdater;
-
-  Acts::MeasurementSelector           measSel{measurementSelectorCfg};
-  ACTSTracking::MeasurementCalibrator measCal{measurements};
-
-  ACTSTracking::SourceLinkAccessor slAccessor;
-  slAccessor.container = &sourceLinks;
-
-  using TrackStateCreatorType = Acts::TrackStateCreator<ACTSTracking::SourceLinkAccessor::Iterator, TrackContainer>;
-  TrackStateCreatorType trackStateCreator;
-  trackStateCreator.sourceLinkAccessor.template connect<&ACTSTracking::SourceLinkAccessor::range>(&slAccessor);
-  trackStateCreator.calibrator.template connect<&ACTSTracking::MeasurementCalibrator::calibrate>(&measCal);
-  trackStateCreator.measurementSelector
-      .template connect<&Acts::MeasurementSelector::select<Acts::VectorMultiTrajectory>>(&measSel);
-
-  Acts::CombinatorialKalmanFilterExtensions<TrackContainer> extensions;
-  extensions.updater.connect<&Acts::GainMatrixUpdater::operator()<Acts::VectorMultiTrajectory>>(&kfUpdater);
-  extensions.createTrackStates.template connect<&TrackStateCreatorType::createTrackStates>(&trackStateCreator);
-
-  TrackFinderOptions ckfOptions =
-      TrackFinderOptions(geometryContext(), magneticFieldContext(), calibrationContext(), extensions, pOptions);
-
-  float minRange = std::numeric_limits<float>::max();
-  float maxRange = std::numeric_limits<float>::lowest();
-  for (const auto& coll : grid) {
-    if (coll.empty())
-      continue;
-
-    const auto* firstEl = coll.front();
-    const auto* lastEl  = coll.back();
-    minRange            = std::min(firstEl->radius(), minRange);
-    maxRange            = std::max(lastEl->radius(), maxRange);
-  }
-
-  auto spacePointsGrouping = Acts::CylindricalBinnedGroup<SSPoint>(std::move(grid), bottomBinFinder, topBinFinder);
-
-  const Acts::Range1D<float> rMiddleSPRange(std::floor(minRange / 2) * 2 + finderCfg.deltaRMiddleMinSPRange,
-                                            std::floor(maxRange / 2) * 2 - finderCfg.deltaRMiddleMaxSPRange);
-
-  // Convert the binned group to a vector for access
-  using GroupIterator = decltype(spacePointsGrouping.begin());
-  using GroupValue    = std::decay_t<decltype(*std::declval<GroupIterator>())>;
-  std::vector<GroupValue> spacePointGroups;
-  spacePointGroups.reserve(spacePointsGrouping.grid().size());
-  for (auto spGroup : spacePointsGrouping) {
-    spacePointGroups.push_back(spGroup);
-  }
-
-  auto parallelSeedingAndTracking = [&](const tbb::blocked_range<size_t>& r) {
-    for (size_t i = r.begin(); i != r.end(); ++i) {
-      const auto paramseeds = findSeeds(finder, finderOpts, spacePointGroups[i], spacePointsGrouping.grid(),
-                                        rMiddleSPRange, spContainer.size(), seedCollection, magCache);
-
-      // Find the tracks
-      if (!m_runCKF)
-        continue;
-
-      if (!tracking(paramseeds, trackFinder, ckfOptions, magCache, trackCollection).isSuccess()) {
+      if (!tracking(paramseeds, trackFinder, ckfOptions, secondOptions, magCache, trackCollection).isSuccess()) {
         warning() << "Tracking failed for this event" << endmsg;
       }
     }
   };  // parallelSeedingAndTracking
 
-  // Run in parallel if more than one thread is requested
   if (m_numThreads > 1) {
     arena.execute(
         [&] { tbb::parallel_for(tbb::blocked_range<size_t>(0, spacePointGroups.size()), parallelSeedingAndTracking); });
-  } else {  // Serial execution
+  } else {
     for (size_t i = 0; i < spacePointGroups.size(); ++i) {
       parallelSeedingAndTracking(tbb::blocked_range<size_t>(i, i + 1));
     }
   }
 
-  debug() << "Track Collection Size: " << trackCollection.size() << endmsg;
+  auto entireEnd = std::chrono::high_resolution_clock::now();
+  info() << "CKF: " << ckfActiveThreads.load() << " thread(s) active for " << spacePointGroups.size()
+         << " seed groups" << endmsg;
+  info() << "Track Collection Size: " << trackCollection.size() << endmsg;
 
   return std::make_tuple(std::move(seedCollection), std::move(trackCollection));
 }
 
-// CKF tracking,
 StatusCode ACTSSeededCKFTrackingAlg::tracking(const std::vector<Acts::BoundTrackParameters>& paramseeds,
                                               const CKF& trackFinder, const TrackFinderOptions& ckfOptions,
+                                              const TrackFinderOptions& secondOptions,
                                               Acts::MagneticFieldProvider::Cache& magCache,
                                               edm4hep::TrackCollection&           trackCollection) const {
-  // Initialize track finder
   debug() << "Starting CKF track finding with " << paramseeds.size() << " seeds." << endmsg;
 
   auto           trackContainer      = std::make_shared<Acts::VectorTrackContainer>();
   auto           trackStateContainer = std::make_shared<Acts::VectorMultiTrajectory>();
   TrackContainer tracks(trackContainer, trackStateContainer);
 
-  auto trackStart = std::chrono::high_resolution_clock::now();
+  for (std::size_t iseed = 0; iseed < paramseeds.size(); ++iseed) {
+    tracks.clear();
 
-    for (std::size_t iseed = 0; iseed < paramseeds.size(); ++iseed) {
-      tracks.clear();
-
-        auto result = trackFinder.findTracks(paramseeds.at(iseed), ckfOptions, tracks);
-        if (result.ok()) {
-          const auto& fitOutput = result.value();
-          for (const TrackContainer::TrackProxy& trackItem : fitOutput) {
-            // Track smoothing
-            auto trackTip = tracks.makeTrack();
-            trackTip.copyFrom(trackItem);
-            auto smoothResult = Acts::smoothTrack(geometryContext(), trackTip);
-            if (!smoothResult.ok()) {
-              warning() << "Track smoothing error: " << smoothResult.error() << endmsg;
-              continue;
-            }
     auto result = trackFinder.findTracks(paramseeds.at(iseed), ckfOptions, tracks);
-    if (result.ok()) {
-      const auto& fitOutput = result.value();
-      for (const TrackContainer::TrackProxy& trackItem : fitOutput) {
-        // Track smoothing
-        auto trackTip = tracks.makeTrack();
-        trackTip.copyFrom(trackItem);
-        auto smoothResult = Acts::smoothTrack(geometryContext(), trackTip);
-        if (!smoothResult.ok()) {
-          warning() << "Track smoothing error: " << smoothResult.error() << endmsg;
-          continue;
+    if (!result.ok()) {
+      warning() << "Track fit error: " << result.error() << endmsg;
+      continue;
+    }
+
+    for (const TrackContainer::TrackProxy& trackItem : result.value()) {
+      auto smoothed = tracks.makeTrack();
+      smoothed.copyFrom(trackItem);
+      auto smoothResult = Acts::smoothTrack(geometryContext(), smoothed);
+      if (!smoothResult.ok()) {
+        warning() << "Track smoothing error: " << smoothResult.error() << endmsg;
+        continue;
+      }
+
+      debug() << "Trajectory Summary" << endmsg;
+      debug() << "\tchi2Sum       " << smoothed.chi2() << endmsg;
+      debug() << "\tNDF           " << smoothed.nDoF() << endmsg;
+      debug() << "\tnHoles        " << smoothed.nHoles() << endmsg;
+      debug() << "\tnMeasurements " << smoothed.nMeasurements() << endmsg;
+      debug() << "\tnOutliers     " << smoothed.nOutliers() << endmsg;
+      debug() << "\tnStates       " << smoothed.nTrackStates() << endmsg;
+
+      if (m_doTwoWayCKF) {
+        // Two-way CKF: first pass + smooth + second pass in opposite direction.
+        // Inside-out (default): forward first pass → backward to perigee.
+        // Outside-in (DoOutsideInCKF):  backward first pass → forward outward into OT.
+        // Ported from Athena TrackFindingAlg.cxx.
+        using ConstTP  = TrackContainer::ConstTrackProxy;
+        using ConstTSP = TrackContainer::ConstTrackStateProxy;
+
+        // Find the second-pass anchor state via last-wins in trackStatesReversed():
+        //   Inside-out (forward first pass): reversed goes outermost→innermost; last-wins = innermost.
+        //     → second pass starts at innermost (VXD), propagates inward to perigee.
+        //   Outside-in (backward first pass): reversed goes innermost→outermost; last-wins = outermost (OIT).
+        //     → second pass starts at outermost (OIT), propagates outward into OT.
+        // Either way: no break — always iterate all states so the HEAD-side measurement wins.
+        ConstTP                 constSmoothed(smoothed);
+        std::optional<ConstTSP> innermostOpt;
+        for (auto st : constSmoothed.trackStatesReversed()) {
+          if (!st.typeFlags().test(Acts::TrackStateFlag::MeasurementFlag)) continue;
+          if (st.typeFlags().test(Acts::TrackStateFlag::OutlierFlag)) continue;
+          innermostOpt = st;
         }
 
-        // Helpful debug output
-        debug() << "Trajectory Summary" << endmsg;
-        debug() << "\tchi2Sum       " << trackTip.chi2() << endmsg;
-        debug() << "\tNDF           " << trackTip.nDoF() << endmsg;
-        debug() << "\tnHoles        " << trackTip.nHoles() << endmsg;
-        debug() << "\tnMeasurements " << trackTip.nMeasurements() << endmsg;
-        debug() << "\tnOutliers     " << trackTip.nOutliers() << endmsg;
-        debug() << "\tnStates       " << trackTip.nTrackStates() << endmsg;
+        if (!innermostOpt.has_value()) {
+          warning() << "TwoWayCKF: no anchor measurement found, falling back to single-pass output." << endmsg;
+        } else {
+          const auto innermostIdx = innermostOpt->index();
 
-          // Make track object
-          edm4hep::MutableTrack* track = ACTSTracking::ACTS2edm4hep_track(trackTip, magneticField(), magCache);
+          // Get smoothed parameters at innermost state; optionally inflate covariance
+          // to prevent over-tight acceptance window in the second pass.
+          Acts::BoundTrackParameters params2 = constSmoothed.createParametersFromState(*innermostOpt);
+          if (m_inflateCovarianceTwoWay) {
+            auto cov2 = *params2.covariance();
+            cov2 *= m_twoWayInflateCovarianceFactor;
+            params2 = Acts::BoundTrackParameters(params2.referenceSurface().getSharedPtr(),
+                                                 params2.parameters(), cov2, params2.particleHypothesis());
+          }
 
-        // Save results
-        {
-          std::lock_guard lock{m_trackMutex};
-          trackCollection.push_back(track);
+          // Second pass: from innermost measurement in opposite direction.
+          // Reuse the same track container so state indices are valid for stitching.
+          auto secondResult = trackFinder.findTracks(params2, secondOptions, tracks);
+          if (!secondResult.ok() || secondResult.value().empty()) {
+            warning() << "TwoWayCKF: second pass "
+                      << (!secondResult.ok() ? std::string("FAILED: ") + secondResult.error().message()
+                                             : std::string("returned EMPTY"))
+                      << ", falling back to single-pass output." << endmsg;
+          } else {
+            auto secondTrack = tracks.makeTrack();
+            secondTrack.copyFrom(*secondResult.value().begin());
+
+            if (m_doOutsideInCKF) {
+              // Outside-in stitching:
+              // After copyFrom on a Forward second pass from OIT: tipIndex()=OT, stemIndex()=OITref (skip state).
+              // innermostIdx = OIT measurement from the first backward pass (HEAD side of smoothed chain).
+              // Link OITref.previous() = OIT_meas to continue the chain into the inner detector.
+              // Full chain: OT_tip → ... → OITref → OIT_meas (1st pass) → IT → VXD (deepest stem).
+              for (auto st : secondTrack.trackStates()) {
+                // trackStates() iterates stem→tip (inside→out); first element = OITref (skip state at start surface)
+                st.previous() = innermostIdx;
+                break;
+              }
+              // The first backward pass has .previous() links going OUTWARD (perigee→VXD→IT→OIT).
+              // After smooth, .next() links go INWARD (OIT→IT→VXD→perigee) via forwardTrackStateRange.
+              // Rewire every first-pass state's .previous() to point INWARD using those .next() links,
+              // so the full stitched chain traversal via .previous() goes OT→OIT→IT→VXD→perigee.
+              {
+                Acts::TrackIndexType prevStateIdx = Acts::kTrackIndexInvalid;
+                for (auto st : smoothed.trackStates()) {
+                  // smoothed.trackStates() = forwardTrackStateRange(stemIndex=OIT) → OIT, IT, VXD, perigee
+                  if (prevStateIdx != Acts::kTrackIndexInvalid) {
+                    tracks.trackStateContainer().getTrackState(prevStateIdx).previous() = st.index();
+                  }
+                  prevStateIdx = st.index();
+                }
+                // Last state (perigee): terminate the chain
+                if (prevStateIdx != Acts::kTrackIndexInvalid) {
+                  tracks.trackStateContainer().getTrackState(prevStateIdx).previous() =
+                      Acts::kTrackIndexInvalid;
+                }
+              }
+              // secondTrack.tipIndex() is already OT — no change needed.
+
+              // Copy perigee parameters from the first backward pass (which targeted perigeeSurface)
+              // so that ACTS2edm4hep_track gets valid AtIP parameters for the stitched output track.
+              secondTrack.setReferenceSurface(smoothed.referenceSurface().getSharedPtr());
+              secondTrack.parameters() = smoothed.parameters();
+              secondTrack.covariance()  = smoothed.covariance();
+            } else {
+              // Inside-out + backward stitching (original two-way CKF).
+              // Reverse second-pass chain.
+              // Before reversal: tipIndex() = perigee (last state), chain runs perigee → ... → VXD10ref(head)
+              // After reversal:  tipIndex() = VXD10ref (old head becomes new tip), chain: VXD10ref → VXD8 → ... → perigee(stem)
+              // reverseTrackStates() updates tipIndex() to the old head each loop iteration.
+              secondTrack.reverseTrackStates();
+
+              // After reversal, secondTrack.tipIndex() == VXD10ref (the hole/reference state at the
+              // starting surface, duplicate of the first-pass innermostIdx). We skip it and link the
+              // first-pass innermost state directly to the first INNER state from the second pass (VXD8).
+              // VXD10ref.previous() == VXD8's index after reversal.
+              const auto firstInnerIdx = (*secondTrack.trackStatesReversed().begin()).previous();
+
+              // Link: first-pass innermost state's previous() → first inner second-pass state
+              for (auto st : smoothed.trackStatesReversed()) {
+                if (st.index() == innermostIdx) {
+                  st.previous() = firstInnerIdx;
+                  break;
+                }
+              }
+
+              // Set stitched track tip to first-pass outermost (outermost OT hit)
+              secondTrack.tipIndex() = smoothed.tipIndex();
+            }
+
+            edm4hep::MutableTrack track =
+                ACTSTracking::ACTS2edm4hep_track(secondTrack, magneticField(), magCache);
+            std::lock_guard lock{m_trackMutex};
+            trackCollection.push_back(track);
+            continue;
+          }
         }
       }
-    } else {
-      warning() << "Track fit error: " << result.error() << endmsg;
+
+      // Single-pass output (DoTwoWayCKF=false, or two-way fallback)
+      edm4hep::MutableTrack track = ACTSTracking::ACTS2edm4hep_track(smoothed, magneticField(), magCache);
+      std::lock_guard       lock{m_trackMutex};
+      trackCollection.push_back(track);
     }
   }
-
-  auto                          trackEnd      = std::chrono::high_resolution_clock::now();
-  std::chrono::duration<double> trackDuration = trackEnd - trackStart;
-  //m_histTrackBuild->Fill(trackDuration.count());
 
   return StatusCode::SUCCESS;
 }

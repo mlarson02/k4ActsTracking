@@ -81,6 +81,10 @@ private:
   Gaudi::Property<float> m_MaxZ0{this, "MaxZ0", 5, "Maximum Z0 value for a track"};
   //! Cut off for momentum
   Gaudi::Property<float> m_MinPt{this, "MinPt", 1.0, "Minimum transverse momentum"};  // units GeV
+  //! Cut off for chi2/ndf (<=0 disables the cut)
+  Gaudi::Property<float> m_MaxChi2OverNdf{this, "MaxChi2OverNdf", -1.0, "Maximum chi2/ndf; <=0 disables cut"};
+  //! Cut off for number of holes (<0 disables the cut)
+  Gaudi::Property<int> m_MaxHoles{this, "MaxHoles", -1, "Maximum number of track holes; <0 disables cut"};
 
   //! Default magnetic field value
   float m_Bz = 3.57;  // units Tesla

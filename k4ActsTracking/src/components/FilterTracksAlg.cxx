@@ -95,6 +95,12 @@ edm4hep::TrackCollection FilterTracksAlg::operator()(const edm4hep::TrackCollect
     if (m_MinPt > 0 && pt < m_MinPt)
       continue;  // pT check
 
+    if (m_MaxChi2OverNdf > 0 && trk.getNdf() > 0 && trk.getChi2() / trk.getNdf() > m_MaxChi2OverNdf)
+      continue;  // chi2/ndf check
+
+    if (m_MaxHoles >= 0 && trk.getNholes() > m_MaxHoles)
+      continue;  // holes check
+
     // add tracks that pass all tests
     outputTracks.push_back(trk);
   }
